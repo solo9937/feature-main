@@ -1,0 +1,6 @@
+flask==2.3.3
+telegram==20.7
+python-telegram-bot==20.7
+requests==2.31.0
+pillow==10.0.1
+werkzeug==2.3.7
